@@ -1,0 +1,8 @@
+*.o
+*.mod
+*.mod.c
+*.mod.cmd
+Makefile
+Module.symvers
+modules.order
+.vscode/
