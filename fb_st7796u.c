@@ -42,6 +42,7 @@ static int init_display(struct fbtft_par *par)
     write_reg(par, 0xb4, 0x01);
 
     write_reg(par, MIPI_DCS_SET_DISPLAY_ON);
+    write_reg(par, MIPI_DCS_EXIT_SLEEP_MODE);
 
     return 0;
 }
