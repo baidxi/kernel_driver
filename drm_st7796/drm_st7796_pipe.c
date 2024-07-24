@@ -10,7 +10,6 @@
 #include <video/mipi_display.h>
 
 #include "drm_st7796.h"
-#include "linux/backlight.h"
 
 #define ST7796_MADCTL_BGR	BIT(3)
 #define ST7796_MADCTL_MV	BIT(5)
