@@ -20,6 +20,7 @@
 #include <linux/workqueue.h>
 #include <linux/cpu.h>
 #include <linux/stat.h>
+#include <linux/spinlock.h>
 
 #define RING_BUF_SIZE   128
 
@@ -52,7 +53,7 @@ const char *benchmark_pkt_type_str[] = {
     "tcp",
     "udp",
     "icmp",
-    "from file",
+    "file",
 };
 
 const char *benchmark_pkt_mode_str[] = {
@@ -86,12 +87,13 @@ struct benchmark_device {
     enum benchmark_pkt_mode mode;
     bool zerocopy;
     char *file_path;
-    struct file *file;
+    char *file_buf;
+    ssize_t file_size;
     char *dev_name;
     bool running;
     int (*start)(struct benchmark_device *);
-    int num_thread;
     int n_repeat;
+    spinlock_t lock;
 };
 
 struct benchmark_data {
@@ -121,14 +123,6 @@ static void bm_dev_tasklet_func(struct tasklet_struct *t)
 
         smp_store_release(&buf->tail, (tail + 1) & (buf->size -1));
     }
-}
-
-static void pkt_close_file(struct benchmark_device *bm_dev)
-{
-    filp_close(bm_dev->file, 0);
-    bm_dev->file = NULL;
-    kfree(bm_dev->file_path);
-    bm_dev->file_path = NULL;
 }
 
 static int bm_dev_open(struct inode *inode, struct file *filp)
@@ -246,7 +240,7 @@ static int bm_dev_mmap(struct file *filp, struct vm_area_struct *vma)
         return ret;
     }
 
-    dev_info(bm_dev->device, "map 0x%lx to 0x%lx, size 0x%x\n", virt_start, vma->vm_start, size);
+    dev_info(bm_dev->device, "map 0x%lx to 0x%lx, size 0x%lx\n", virt_start, vma->vm_start, size);
 
     return 0;
 }
@@ -332,7 +326,6 @@ static ssize_t bm_device_reset_store(struct device *dev, struct device_attribute
         }
 
         if (bm_dev->src == BM_PKT_SRC_FILE) {
-            pkt_close_file(bm_dev);
             bm_dev->src = BM_PKT_SRC_RANDOM;
             bm_dev->type = BM_PKT_TYPE_TCP;
         }
@@ -344,7 +337,7 @@ static ssize_t bm_device_reset_store(struct device *dev, struct device_attribute
 static ssize_t bm_device_bufsize_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
     struct benchmark_device *bm_dev = dev_get_drvdata(dev);
-    return snprintf(buf, PAGE_SIZE-1, "%d\n", bm_dev->buf_size);
+    return snprintf(buf, PAGE_SIZE-1, "%ld\n", bm_dev->buf_size);
 }
 
 static ssize_t bm_device_bufsize_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
@@ -403,7 +396,10 @@ static ssize_t pkt_source_show(struct device *dev, struct device_attribute *attr
 static ssize_t pkt_file_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
 {
     struct benchmark_device *bm_dev = dev_get_drvdata(dev);
+    struct inode *inode;
     struct file *file;
+    size_t file_size;
+    loff_t off = 0;
     char *path;
     int ret;
 
@@ -412,21 +408,29 @@ static ssize_t pkt_file_store(struct device *dev, struct device_attribute *attr,
 
     if (buf[0] != '/' && strcmp(buf, "random") == 0) {
         bm_dev->src = BM_PKT_SRC_RANDOM;
-        if (bm_dev->file) {
-            pkt_close_file(bm_dev);
+        if (bm_dev->file_buf) {
+            kfree(bm_dev->file_buf);
+            bm_dev->file_buf = NULL;
+        }
+
+        if (bm_dev->file_path) {
+            kfree(bm_dev->file_path);
+            bm_dev->file_path = NULL;
         }
     } else if (buf[0] == '/') {
         path = kstrndup(buf, size-1, GFP_KERNEL);
         if (!path)
             return -ENOMEM;
 
-        if (bm_dev->file) {
-            pkt_close_file(bm_dev);
-        }
+        if (bm_dev->file_path)
+            kfree(bm_dev->file_path);
+
+        if (bm_dev->file_buf)
+            kfree(bm_dev->file_buf);
+
         file = filp_open(path, O_RDONLY, 0);
-        if (IS_ERR(bm_dev->file)) {
-            ret = PTR_ERR(bm_dev->file);
-            bm_dev->file = NULL;
+        if (IS_ERR(file)) {
+            ret = PTR_ERR(file);
             return ret;
         }
 
@@ -442,8 +446,28 @@ static ssize_t pkt_file_store(struct device *dev, struct device_attribute *attr,
             return -EFAULT;
         }
 
+        dev_info(bm_dev->device, "file path:%s\n", path);
+
+        inode = file_inode(file);
+        if (!inode) {
+            kfree(path);
+            return -ENOENT;
+        }
+
+        file_size = i_size_read(inode);
+
+        bm_dev->file_size = file_size;
+        bm_dev->file_buf = kmalloc(file_size, GFP_KERNEL);
+        if (!bm_dev->file_buf) {
+            kfree(path);
+            return -ENOMEM;
+        }
+
+        kernel_read(file, bm_dev->file_buf, file_size, &off);
+
+        filp_close(file, 0);
+
         bm_dev->file_path = path;
-        bm_dev->file = file;
         bm_dev->type = BM_PKT_TYPE_FILE;
         bm_dev->n_repeat = 1;
     } else {
@@ -492,32 +516,13 @@ static ssize_t bm_device_pkt_start_store(struct device *dev, struct device_attri
         return ret;
 
     if (val) {
-        bm_dev->running = true;
-        ret = bm_dev->start(bm_dev);
-        if (ret)
-            return ret;
+        if (!bm_dev->running) {
+            bm_dev->running = true;
+            ret = bm_dev->start(bm_dev);
+            if (ret)
+                return ret;
+        }
     }
-
-    return size;
-}
-
-static ssize_t bm_device_num_threads_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    struct benchmark_device *bm_dev = dev_get_drvdata(dev);
-    return sprintf(buf, "%d\n", bm_dev->num_thread);
-}
-
-static ssize_t bm_device_num_threads_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
-{
-    struct benchmark_device *bm_dev = dev_get_drvdata(dev);
-    unsigned long val;
-    int ret;
-
-    ret = kstrtoul(buf, 0, &val);
-    if (ret)
-        return ret;
-
-    bm_dev->num_thread = val;
 
     return size;
 }
@@ -546,7 +551,6 @@ static ssize_t bm_device_n_repeat_store(struct device *dev, struct device_attrib
 }
 
 DEVICE_ATTR(n_repeat, 0644, bm_device_n_repeat_show, bm_device_n_repeat_store);
-DEVICE_ATTR(num_threads, 0644, bm_device_num_threads_show, bm_device_num_threads_store);
 DEVICE_ATTR(pkt_start, 0644, bm_device_pkt_start_show, bm_device_pkt_start_store);
 DEVICE_ATTR(pkt_mode, 0644, bm_device_pkt_mode_show, bm_device_pkt_mode_store);
 DEVICE_ATTR_WO(pkt_file);
@@ -565,7 +569,6 @@ static struct attribute *bm_device_attrs[] = {
     &dev_attr_pkt_file.attr,
     &dev_attr_pkt_mode.attr,
     &dev_attr_pkt_start.attr,
-    &dev_attr_num_threads.attr,
     &dev_attr_n_repeat.attr,
     NULL,
 };
@@ -580,7 +583,7 @@ static int bm_device_start(struct benchmark_device *bm_dev)
     if (!bm_dev->out_dev)
         return -ENOENT;
 
-    if ((bm_dev->src == BM_PKT_SRC_FILE || bm_dev->src == BM_PKT_SRC_DEVICE) && !bm_dev->file)
+    if (!bm_dev->file_buf)
         return -EINVAL;
 
     cpus_read_lock();
@@ -593,7 +596,9 @@ static int bm_device_start(struct benchmark_device *bm_dev)
             cpumask_set_cpu(i, &cpus);
         }
     } else if (bm_dev->src == BM_PKT_SRC_FILE) {
-        queue_work(system_highpri_wq, this_cpu_ptr(&benchmark_works));
+        struct benchmark_data *bmd = this_cpu_ptr(&benchmark_data);
+        queue_work_on(bmd->cpu, system_highpri_wq, per_cpu_ptr(&benchmark_works, bmd->cpu));
+        cpumask_set_cpu(bmd->cpu, &cpus);
     }
 
     cpus_read_unlock();
@@ -613,6 +618,8 @@ static int benchmark_send_buf(struct net_device *dev, char *buf, size_t size)
 
     ret = dev->netdev_ops->ndo_start_xmit(skb, dev);
 
+    netdev_info(dev, "xmit %ld %d\n",size, ret);
+
     if (ret) {
         dev_kfree_skb_any(skb);
     }
@@ -622,74 +629,44 @@ static int benchmark_send_buf(struct net_device *dev, char *buf, size_t size)
 
 static void benchmark_from_file(struct benchmark_device *bm_dev)
 {
-    struct kstat stat;
-    struct file *file;
     struct net_device *netdev = bm_dev->out_dev;
-    int romain = 0;
-    char *buf;
+    struct benchmark_data *bmd = this_cpu_ptr(&benchmark_data);
+    int n_repeat = bm_dev->n_repeat - 1;
+    int remain = 0;
     int ret;
-    loff_t off;
-    size_t size;
+    loff_t off = 0;
 
-    if (!bm_dev->file)
+    if (!bm_dev->file_buf)
         return;
-    
-    file = bm_dev->file;
 
-    ret = vfs_getattr(&file->f_path, &stat, STATX_BASIC_STATS, 0);
+    dev_info(bm_dev->device, "repeat send %d on cpu %d\n", bm_dev->n_repeat, bmd->cpu);
 
-    if (ret) {
-        dev_err(bm_dev->device, "FAILED to stat %s:%d\n", bm_dev->file_path, ret);
-        return;
-    }
-
-    buf = kzalloc(netdev->mtu, GFP_KERNEL);
-    if (!buf) {
-        dev_err(bm_dev->device, "FAILED to out of memory\n");
-        return;
-    }
-
-    while((bm_dev->n_repeat || bm_dev->mode == BM_PKT_MODE_CONTINUE) && bm_dev->running) {
-        u32 loop, i;
-        romain = stat.size;
+    do {
+        u32 loop_cnt, i;
+        loop_cnt = bm_dev->file_size / netdev->mtu;
+        remain = bm_dev->file_size % netdev->mtu;
         off = 0;
-        loop = romain / netdev->mtu;
 
-        for (i = 0; i < loop; i++) {
-            size = kernel_read(bm_dev->file, buf, netdev->mtu, &off);
-            if (size <= 0) {
-                dev_err(bm_dev->device, "FAILED to read %s offset %lld errno:%d\n", bm_dev->file_path, off, size);
-                break;
-            }
-            romain -= size;
-            off += size;
-            ret = benchmark_send_buf(netdev, buf, size);
+        for (i = 0; i < loop_cnt; i++) {
+            ret = benchmark_send_buf(netdev, bm_dev->file_buf + off, netdev->mtu);
             if (ret) {
                 dev_err(bm_dev->device, "FAILED to send buf:%d\n", ret);
                 goto out;
             }
+            off += netdev->mtu;
         }
 
-        if (romain > 0 && romain < netdev->mtu) {
-            size = kernel_read(bm_dev->file, buf, romain, loop ? &off : NULL);
-            if (size <= 0) {
-                dev_err(bm_dev->device, "FAILED to read %s:%d\n", bm_dev->file_path, size);
-                goto out;
-            }
-
-            ret = benchmark_send_buf(netdev, buf, size);
+        if (remain) {
+            ret = benchmark_send_buf(netdev, bm_dev->file_buf + off, remain);
             if (ret) {
-                dev_err(bm_dev->device, "FAILED to send buf:%d\n", ret);
+                dev_err(bm_dev->device, "FAILED  to send buf:%d\n", ret);
                 goto out;
             }
         }
-
-        if (bm_dev->mode != BM_PKT_MODE_CONTINUE)
-            bm_dev->n_repeat--;
-    }
-
+        dev_info(bm_dev->device, "loop send %d\n", n_repeat);
+    }while(n_repeat--);
 out:
-    kfree(buf);
+    bm_dev->running = false;
 }
 
 static void benchmark_from_random(struct benchmark_device *bm_dev)
@@ -724,6 +701,7 @@ static int __net_init bm_net_init(struct net *net)
 
     bm_dev->net = net;
     bm_dev->start = bm_device_start;
+    spin_lock_init(&bm_dev->lock);
 
     bm_dev->cls = class_create(THIS_MODULE, "bm_dev");
     if (IS_ERR(bm_dev->cls)) {
@@ -783,9 +761,10 @@ static void __net_exit bm_net_exit(struct net *net)
 
     }
 
-    if (bm_dev->file) {
-        pkt_close_file(bm_dev);
-    }
+    if (bm_dev->file_buf)
+        kfree(bm_dev->file_buf);
+    if (bm_dev->file_path)
+        kfree(bm_dev->file_path);
 }
 
 static int bm_device_event(struct notifier_block *nb, unsigned long event, void *ptr)
